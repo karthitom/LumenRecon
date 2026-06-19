@@ -14,7 +14,7 @@
 
 ## What is LumenRecon?
 
-LumenRecon is a modular, terminal-first network reconnaissance tool that wraps [Nmap](https://nmap.org) in a secure, beginner-friendly interface. Where traditional recon tools leave you reading raw command output, LumenRecon illuminates the results — colour-coded, structured, and ready to export.
+LumenRecon is a modular, terminal-first network reconnaissance tool that wraps [Nmap](https://nmap.org) in a secure, beginner-friendly interface. Where traditional recon tools leave you reading ra[...]
 
 Built strictly for **defensive security work**: understanding your own attack surface, validating firewall rules, and monitoring asset changes over time.
 
@@ -98,18 +98,53 @@ cd lumenrecon
 
 ### 3 — Create a virtual environment (recommended)
 
+We recommend using a virtual environment to isolate project dependencies.
+
+Recommended Python: this project targets Python 3.10+. Confirm with:
+
 ```bash
-python -m venv .venv
-
-# Linux / macOS
-source .venv/bin/activate
-
-# Windows (cmd)
-.venv\Scripts\activate.bat
-
-# Windows (PowerShell)
-.venv\Scripts\Activate.ps1
+python --version
+# or
+python3 --version
 ```
+
+POSIX (macOS / Linux)
+```bash
+# create a venv in the project directory
+python3 -m venv .venv
+# activate the venv
+source .venv/bin/activate
+# upgrade pip and install dependencies
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Windows (PowerShell)
+```powershell
+# create venv
+py -3 -m venv .venv
+# activate
+.\.venv\Scripts\Activate.ps1
+# upgrade pip and install dependencies
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Windows (cmd.exe)
+```cmd
+py -3 -m venv .venv
+.venv\Scripts\activate.bat
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Optional tools
+- Poetry: `poetry install` (if the project uses Poetry)
+- Pipenv: `pipenv install` (if the project uses Pipenv)
+
+Notes
+- Add `.venv/` (or your venv directory) to `.gitignore` to avoid committing local environments.
+- If the project specifies a Python version in `pyproject.toml` or other metadata, reference that here instead of the generic recommendation.
 
 ---
 
@@ -234,7 +269,7 @@ host, hostname, host_state, port, protocol, state, service, version
 
 LumenRecon is built with security-first principles at every layer:
 
-- **No shell execution.** `subprocess.run()` is always called with `shell=False` and a `list[str]` command. The target string is a single list element — it can never be interpreted as a shell command or inject additional flags.
+- **No shell execution.** `subprocess.run()` is always called with `shell=False` and a `list[str]` command. The target string is a single list element — it can never be interpreted as a shell c[...]
 - **Strict input allowlisting.** Targets are validated by Python's `ipaddress` module (for IPv4) and a compiled RFC-1123 regex (for domains) before any subprocess call is made.
 - **Blocked reserved ranges.** Loopback (`127.x`), unspecified (`0.0.0.0`), multicast, and link-local addresses are explicitly rejected at the CLI layer.
 - **Output format constrained.** The `--output` flag only accepts the literal strings `json` or `csv` — no free-form strings ever reach the filesystem layer.
