@@ -1,5 +1,5 @@
 """
-scanner.py — Core Scanner Module  [LumenRecon v2.0]
+scanner.py — Core Scanner Module  [LumenRecon v2.1]
 =====================================================
 Safely invokes Nmap via subprocess and returns structured output for
 downstream parsing.  No exploitation, no brute-forcing — strictly port
@@ -7,37 +7,42 @@ enumeration and service detection for authorised targets only.
 
 Public API
 ----------
-    run_scan(target, scan_type, timeout)         -> ScanResult
-    run_scan_from_args(args)                     -> list[ScanResult]
-    is_nmap_available()                          -> bool
+    run_scan(target, scan_type, timeout)   -> ScanResult
+    run_scan_from_args(args)               -> list[ScanResult]
+    discover_live_hosts(target, timeout)   -> list[str]
+    is_nmap_available()                    -> bool
 
-V2.0 additions
---------------
-    run_scan_from_args now returns list[ScanResult] in ALL cases:
-      - Single IP / domain → list with exactly one element.
-      - CIDR subnet        → list with one element per responsive host,
-                             using ThreadPoolExecutor for parallelism.
+Two-Phase Scanning (v2.1)
+--------------------------
+Subnet scans now run in two distinct phases:
 
-    _scan_worker(ip, scan_type, timeout)         -> ScanResult | None
-        Internal thread worker.  Returns None for hosts that are down or
-        produce no usable output (filtered out before returning to caller).
+  Phase 1 — Host Discovery  (nmap -sn)
+    discover_live_hosts() runs a fast ping sweep against the entire
+    subnet using a single nmap -sn invocation.  Only IPs reported as
+    "up" are returned.  This phase typically completes in seconds and
+    eliminates all dead addresses before any port scanning begins,
+    which is the primary fix for timeout exhaustion on sparse subnets.
 
-    _run_subnet_scan(network, scan_type, timeout, max_workers)
-                                                 -> list[ScanResult]
-        Iterates usable hosts in *network*, submits each to the thread
-        pool, collects and filters results.
+  Phase 2 — Targeted Port Scan  (parallel, ThreadPoolExecutor)
+    _run_subnet_scan() receives only the live IPs from Phase 1 and
+    submits them to the thread pool.  Every worker calls run_scan()
+    which calls subprocess.run(shell=False) — the security model is
+    identical to a single-host scan.
+
+  For single IPs / domains, discover_live_hosts() is called first to
+  verify the host is up before committing to a full port scan.  If the
+  host appears down the user is warned and given the option to abort.
 
 Security model
 --------------
     * subprocess.run() is called with shell=False at all times.
-    * The command is always built as a strict list[str].
-    * The target IP string is a single, final list element — never
-      interpolated into a shell string.
-    * extra_flags elements must start with '-' (positional-injection guard).
-    * ThreadPoolExecutor workers are stateless; each owns its own
-      subprocess call and ScanResult, so there is no shared mutable state
-      between threads.
-    * Thread count is bounded by the value validated in cli.py (max 50).
+    * Every command is a strict list[str] — targets are single list
+      elements, never interpolated into shell strings.
+    * extra_flags elements must start with '-' (injection guard).
+    * ThreadPoolExecutor workers are stateless — no shared mutable state.
+    * Thread count is bounded by cli.py validation (max 50).
+    * The ping-sweep command (nmap -sn) is built with the same
+      _build_discovery_cmd() helper and the same shell=False policy.
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import logging
+import re
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -52,12 +58,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
+from rich.console import Console
+
 import cli   # only used for cli.is_subnet() — no circular dependency risk
 
 # ---------------------------------------------------------------------------
-# Module-level logger
+# Module-level logger and console
 # ---------------------------------------------------------------------------
-logger = logging.getLogger(__name__)
+logger  = logging.getLogger(__name__)
+console = Console(highlight=False)   # for Phase 1 status messages
 
 
 # ---------------------------------------------------------------------------
@@ -69,8 +78,7 @@ class NmapNotFoundError(EnvironmentError):
 
 
 class ScanTimeoutError(TimeoutError):
-    """Raised when an nmap process exceeds the configured wall-clock limit.
-    In subnet mode this is per-host; the overall scan continues."""
+    """Raised when an nmap process exceeds the configured wall-clock limit."""
 
 
 class ScanError(RuntimeError):
@@ -82,9 +90,8 @@ class ScanError(RuntimeError):
 # Scan profiles
 # ---------------------------------------------------------------------------
 
-# Mapping from validated scan-type name → exact nmap flags.
-# This is the single source of truth — change here and it propagates.
-# Deliberately minimal: no timing flags, no OS detection, no NSE scripts.
+# Single source of truth for nmap flags per profile.
+# Deliberately minimal: no OS detection, no NSE scripts, no timing flags.
 SCAN_PROFILES: dict[str, list[str]] = {
     "fast":    ["-F"],          # Top 100 most common ports
     "service": ["-sV"],         # Service/version detection, top 1000 ports
@@ -92,7 +99,12 @@ SCAN_PROFILES: dict[str, list[str]] = {
 }
 
 _DEFAULT_SCAN_TYPE: str = "fast"
-DEFAULT_TIMEOUT:    int = 300   # seconds
+DEFAULT_TIMEOUT:    int = 300    # per-host port-scan timeout (seconds)
+
+# Phase 1 ping-sweep timeout.
+# Capped at 60 s regardless of the user's --timeout value so the discovery
+# phase never blocks longer than a minute even on very slow networks.
+_DISCOVERY_TIMEOUT_CAP: int = 60   # seconds
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +148,7 @@ class ScanResult:
 
     @property
     def iso_timestamp(self) -> str:
-        """ISO-8601 UTC timestamp, e.g. '2025-06-19T10:30:00Z'."""
+        """ISO-8601 UTC timestamp, e.g. '2026-06-19T10:30:00Z'."""
         return self.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     @property
@@ -161,16 +173,12 @@ def is_nmap_available() -> bool:
 
 
 def _resolve_scan_type(scan_type: str) -> str:
-    """
-    Return the normalised scan_type key, falling back to the default if
-    the value is unrecognised.  Logs a warning on fallback.
-    """
+    """Return the normalised scan_type key, falling back to the default."""
     normalised = scan_type.lower().strip()
     if normalised not in SCAN_PROFILES:
         logger.warning(
             "Unknown scan_type '%s' — falling back to '%s'.",
-            scan_type,
-            _DEFAULT_SCAN_TYPE,
+            scan_type, _DEFAULT_SCAN_TYPE,
         )
         return _DEFAULT_SCAN_TYPE
     return normalised
@@ -182,26 +190,10 @@ def _build_cmd(
     extra_flags: Optional[list[str]] = None,
 ) -> list[str]:
     """
-    Build the nmap command as a strict list[str].
+    Build the nmap port-scan command as a strict list[str].
 
-    The target is always the final element so no flag can be appended
-    after it.  extra_flags elements must start with '-' to prevent
-    positional-argument injection.
-
-    Parameters
-    ----------
-    target : str
-        Validated single IP address string.
-    scan_type : str
-        Resolved key from SCAN_PROFILES.
-    extra_flags : list[str] | None
-        Optional additional nmap flags.  Every element must be a str
-        starting with '-'.
-
-    Returns
-    -------
-    list[str]
-        Complete command ready for subprocess.run(cmd, shell=False).
+    The target is always the final element.  extra_flags elements must
+    start with '-' to prevent positional-argument injection.
 
     Raises
     ------
@@ -230,13 +222,177 @@ def _build_cmd(
                 )
         cmd.extend(extra_flags)
 
-    # Target is always the final positional argument.
-    cmd.append(target)
+    cmd.append(target)   # target is always the final positional argument
     return cmd
 
 
+def _build_discovery_cmd(target: str) -> list[str]:
+    """
+    Build the nmap ping-sweep command as a strict list[str].
+
+    Uses -sn (no port scan, host discovery only) and -T4 (aggressive
+    timing for faster sweeps on local networks).  The target is a CIDR
+    string or single IP — always the final list element.
+
+    -sn   : Skip port scanning; only determine host liveness.
+    -T4   : Aggressive timing template (faster probes, less patience for
+            slow responses).  Safe for local LANs; use -T3 on WAN.
+    --open: Not used here; we want all "up" hosts regardless of whether
+            any ports are open (port scanning is Phase 2's job).
+
+    Parameters
+    ----------
+    target : str
+        A validated CIDR string (e.g. '192.168.1.0/24') or single IP.
+    """
+    # The target is injected as the final positional list element,
+    # never concatenated into a shell string.
+    return ["nmap", "-sn", "-T4", target]
+
+
 # ---------------------------------------------------------------------------
-# Core single-host scanner
+# Phase 1 — Host Discovery
+# ---------------------------------------------------------------------------
+
+# Regex to extract an IP address from an nmap "Nmap scan report for" line.
+# Handles both bare IPs and "hostname (IP)" variants.
+#
+# Examples matched:
+#   Nmap scan report for 192.168.1.1
+#   Nmap scan report for router.local (192.168.1.1)
+_REPORT_LINE_RE = re.compile(
+    r"Nmap scan report for\s+"
+    r"(?:[^\s(]+\s+\((?P<ip_in_parens>[^)]+)\)|(?P<bare_ip>\S+))"
+)
+
+# "Host is up" confirmation line — we only return IPs that follow this.
+_HOST_UP_RE = re.compile(r"Host is up", re.IGNORECASE)
+
+
+def discover_live_hosts(
+    target: str,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> list[str]:
+    """
+    Phase 1: Run an nmap ping sweep to find live hosts.
+
+    Executes ``nmap -sn -T4 <target>`` and parses stdout to extract only
+    the IP addresses of hosts reported as "up".  No port scanning occurs.
+
+    Works for both a CIDR subnet (returns all live IPs in the range) and
+    a single IP address (returns a one-element list if up, empty if down).
+
+    Parameters
+    ----------
+    target : str
+        A validated CIDR string (e.g. '192.168.1.0/24') or single IPv4.
+        Must have been sanitised by cli._validate_target() already.
+    timeout : int
+        Wall-clock timeout for the entire ping sweep in seconds.
+        Automatically capped at _DISCOVERY_TIMEOUT_CAP (60 s) regardless
+        of the value passed, so the discovery phase never blocks longer
+        than a minute even when the user set --timeout 600.
+
+    Returns
+    -------
+    list[str]
+        Sorted list of IPv4 address strings that responded to probes.
+        Empty list if no hosts are reachable.
+
+    Raises
+    ------
+    NmapNotFoundError
+        If nmap is not on the system PATH.
+    ScanError
+        If nmap exits with a non-zero return code during discovery.
+    """
+    if not is_nmap_available():
+        raise NmapNotFoundError(
+            "nmap is not installed or not on PATH.\n"
+            "  Debian/Ubuntu : sudo apt-get install nmap\n"
+            "  macOS Homebrew: brew install nmap\n"
+            "  Windows       : https://nmap.org/download.html"
+        )
+
+    # Cap the discovery timeout — ping sweeps should be fast.
+    discovery_timeout = min(timeout, _DISCOVERY_TIMEOUT_CAP)
+
+    cmd = _build_discovery_cmd(target)
+    logger.info("Phase 1 — Host Discovery: %s", " ".join(cmd))
+
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=False,          # NO shell interpretation
+            capture_output=True,  # stdout and stderr separately
+            text=True,            # decode bytes → str
+            timeout=discovery_timeout,
+        )
+    except FileNotFoundError:
+        raise NmapNotFoundError(
+            "nmap binary could not be executed — it may have been removed."
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "Host discovery timed out after %ds for '%s'. "
+            "Proceeding with empty host list.", discovery_timeout, target,
+        )
+        # Return empty rather than raising — the user can still try a
+        # direct single-host scan with an explicit target.
+        return []
+    except subprocess.SubprocessError as exc:
+        raise ScanError(f"Host discovery subprocess failed: {exc}") from exc
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "No detail from nmap."
+        logger.error(
+            "nmap -sn returned code %d for '%s'.  Detail: %s",
+            result.returncode, target, detail,
+        )
+        raise ScanError(
+            f"nmap ping sweep exited with code {result.returncode}.\n"
+            f"  stderr: {detail}"
+        )
+
+    # ---- Parse stdout to extract live IPs --------------------------------
+    live_ips: list[str] = []
+    current_ip: Optional[str] = None
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+
+        # A "scan report" line introduces a new host entry.
+        report_match = _REPORT_LINE_RE.search(line)
+        if report_match:
+            # Extract whichever capture group matched.
+            current_ip = (
+                report_match.group("ip_in_parens")
+                or report_match.group("bare_ip")
+            )
+            continue
+
+        # Only record the IP if the very next host-state line says "up".
+        if current_ip and _HOST_UP_RE.search(line):
+            live_ips.append(current_ip)
+            logger.debug("Host discovery: '%s' is UP.", current_ip)
+            current_ip = None   # reset for next host block
+
+    # Sort numerically by IP address for deterministic output.
+    try:
+        live_ips.sort(key=lambda ip: ipaddress.IPv4Address(ip))
+    except ValueError:
+        # Non-IPv4 entries (e.g. hostnames) — sort lexicographically.
+        live_ips.sort()
+
+    logger.info(
+        "Host discovery complete for '%s': %d live host(s) found.",
+        target, len(live_ips),
+    )
+    return live_ips
+
+
+# ---------------------------------------------------------------------------
+# Core single-host scanner  (Phase 2 primitive)
 # ---------------------------------------------------------------------------
 
 def run_scan(
@@ -246,10 +402,10 @@ def run_scan(
     extra_flags: Optional[list[str]] = None,
 ) -> ScanResult:
     """
-    Execute an Nmap scan against a single *target* and return a ScanResult.
+    Execute an Nmap port scan against a single *target*.
 
-    This function is the low-level primitive.  Subnet scanning builds on
-    top of it via _scan_worker / _run_subnet_scan.
+    This is the low-level primitive.  The two-phase subnet flow calls
+    this indirectly via _scan_worker().
 
     Parameters
     ----------
@@ -258,7 +414,7 @@ def run_scan(
     scan_type : str
         Scan profile: 'fast', 'service', or 'full'.
     timeout : int
-        Hard wall-clock limit in seconds (passed directly to subprocess).
+        Hard wall-clock limit in seconds.
     extra_flags : list[str] | None
         Optional additional nmap flags (see _build_cmd).
 
@@ -270,9 +426,8 @@ def run_scan(
     ------
     NmapNotFoundError  — nmap missing from PATH.
     ScanTimeoutError   — scan exceeded the timeout.
-    ScanError          — non-zero nmap exit code or subprocess failure.
+    ScanError          — non-zero exit code or subprocess failure.
     """
-    # --- Pre-flight -------------------------------------------------------
     if not is_nmap_available():
         raise NmapNotFoundError(
             "nmap is not installed or not on PATH.\n"
@@ -281,41 +436,37 @@ def run_scan(
             "  Windows       : https://nmap.org/download.html"
         )
 
-    # --- Build command ----------------------------------------------------
     effective_type = _resolve_scan_type(scan_type)
     cmd = _build_cmd(target, effective_type, extra_flags)
 
-    logger.info("Executing: %s", " ".join(cmd))
+    logger.info("Phase 2 — Port Scan: %s", " ".join(cmd))
     scan_timestamp = datetime.now(tz=timezone.utc)
 
-    # --- Execute ----------------------------------------------------------
     try:
         result = subprocess.run(
-            cmd,                 # strict list — never a shell string
-            shell=False,         # explicit: NO shell interpretation
-            capture_output=True, # stdout and stderr captured separately
-            text=True,           # decode bytes → str (UTF-8 default)
-            timeout=timeout,     # hard wall-clock limit
+            cmd,
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
     except FileNotFoundError:
-        # Race condition: nmap vanished after shutil.which() confirmed it.
         logger.error("nmap binary disappeared between PATH check and exec.")
         raise NmapNotFoundError(
             "nmap binary could not be executed — it may have been removed."
         )
     except subprocess.TimeoutExpired:
         logger.warning(
-            "Scan timed out after %ds for target '%s'.", timeout, target
+            "Port scan timed out after %ds for target '%s'.", timeout, target
         )
         raise ScanTimeoutError(
-            f"Nmap timed out after {timeout}s for '{target}'.\n"
-            f"  Try a faster profile (-s fast) or increase --timeout."
+            f"nmap timed out after {timeout}s for '{target}'.\n"
+            "  Try a faster profile (-s fast) or increase --timeout."
         )
     except subprocess.SubprocessError as exc:
         logger.error("Subprocess error running nmap: %s", exc)
         raise ScanError(f"Failed to execute nmap: {exc}") from exc
 
-    # --- Wrap result ------------------------------------------------------
     scan_result = ScanResult(
         target=target,
         scan_type=effective_type,
@@ -326,11 +477,10 @@ def run_scan(
         cmd=cmd,
     )
 
-    # --- Check exit code --------------------------------------------------
     if not scan_result.succeeded:
-        detail = scan_result.stderr or "No additional detail from nmap."
+        detail = scan_result.stderr or "No detail from nmap."
         logger.error(
-            "nmap returned code %d for '%s'.  Detail: %s",
+            "nmap returned code %d for '%s'. Detail: %s",
             scan_result.returncode, target, detail,
         )
         raise ScanError(
@@ -340,19 +490,19 @@ def run_scan(
 
     if not scan_result.stdout:
         logger.warning(
-            "nmap produced no output for '%s'.  "
+            "nmap produced no output for '%s'. "
             "Host may be down or blocking all probes.", target,
         )
 
     logger.info(
-        "Scan complete — target='%s' type='%s' rc=%d.",
+        "Port scan complete — target='%s' type='%s' rc=%d.",
         target, effective_type, scan_result.returncode,
     )
     return scan_result
 
 
 # ---------------------------------------------------------------------------
-# Thread worker  — called by the ThreadPoolExecutor, one per host
+# Thread worker  — one per live host in Phase 2
 # ---------------------------------------------------------------------------
 
 def _scan_worker(
@@ -361,45 +511,29 @@ def _scan_worker(
     timeout: int,
 ) -> Optional[ScanResult]:
     """
-    Scan a single IP address and return the ScanResult, or None if the
-    host appears to be down or produced no open-port data.
+    Port-scan a single live IP address inside a ThreadPoolExecutor.
 
-    This function is designed to be called from a ThreadPoolExecutor.
-    It is intentionally tolerant — per-host errors are logged but do not
-    propagate, keeping the overall subnet scan alive.
+    Designed to be called only with IPs that passed Phase 1 discovery,
+    so the "host is down" case should be rare here.  Still handles it
+    gracefully to cover hosts that go offline between discovery and scan.
 
-    Parameters
-    ----------
-    ip : str
-        A single IPv4 address string (produced by iterating
-        IPv4Network.hosts()).
-    scan_type : str
-        Scan profile name.
-    timeout : int
-        Per-host wall-clock timeout in seconds.
-
-    Returns
-    -------
-    ScanResult | None
-        A ScanResult when the host responds and has open/filtered ports.
-        None when the host is down, unresponsive, or nmap found nothing.
+    Returns ScanResult on success, None if the host produced no data.
+    NmapNotFoundError is re-raised so the pool manager can abort cleanly.
     """
     try:
         result = run_scan(target=ip, scan_type=scan_type, timeout=timeout)
     except ScanTimeoutError:
-        # Per-host timeout in a subnet scan is not fatal — host is likely
-        # filtered or unreachable; skip it silently.
-        logger.debug("Host '%s' timed out — skipping.", ip)
+        # Unlikely after Phase 1 filtered out dead hosts, but possible on
+        # very slow / filtered hosts.  Skip gracefully.
+        logger.warning("Port scan timed out for '%s' — skipping.", ip)
         return None
     except ScanError as exc:
-        # Non-zero nmap exit usually means host is down.  Skip quietly.
-        logger.debug("Host '%s' scan error (likely down): %s", ip, exc)
+        # Non-zero nmap exit after Phase 1 confirmation — log and skip.
+        logger.warning("Port scan error for '%s': %s — skipping.", ip, exc)
         return None
     except NmapNotFoundError:
-        # nmap vanished mid-scan — re-raise so the pool manager can abort.
-        raise
+        raise   # always fatal — bubble up to pool manager
 
-    # Drop results with empty stdout — host is down or blocking all probes.
     if not result.has_data:
         logger.debug("Host '%s' returned no port data — skipping.", ip)
         return None
@@ -408,7 +542,7 @@ def _scan_worker(
 
 
 # ---------------------------------------------------------------------------
-# Subnet scan manager
+# Two-phase subnet scan manager
 # ---------------------------------------------------------------------------
 
 def _run_subnet_scan(
@@ -418,59 +552,84 @@ def _run_subnet_scan(
     max_workers: int,
 ) -> list[ScanResult]:
     """
-    Scan all usable hosts in *network* in parallel using a thread pool.
+    Orchestrate the two-phase subnet scan:
 
-    Each worker calls _scan_worker() which calls run_scan() which calls
-    subprocess.run(shell=False) — the security model is identical to a
-    single-host scan.  Workers share no mutable state.
+      Phase 1 — discover_live_hosts(): ping sweep the entire subnet.
+      Phase 2 — ThreadPoolExecutor: port-scan only the live IPs.
+
+    Rich status messages are printed directly so the user sees progress
+    without needing to watch log output.
 
     Parameters
     ----------
     network : ipaddress.IPv4Network
-        The validated, canonical network to sweep.
+        The validated, canonical network object.
     scan_type : str
         Scan profile name.
     timeout : int
-        Per-host wall-clock timeout in seconds.
+        Per-host port-scan timeout in seconds.  Discovery timeout is
+        independently capped at _DISCOVERY_TIMEOUT_CAP.
     max_workers : int
-        Maximum number of concurrent nmap processes.  Bounded by cli.py
-        to _MAX_THREADS (50).
+        Maximum concurrent nmap processes for Phase 2.
 
     Returns
     -------
     list[ScanResult]
-        Results for hosts that responded with port data, sorted by IP.
-        Hosts that are down or unresponsive are silently excluded.
+        Port-scan results for all responding live hosts, sorted by IP.
+        Empty list if Phase 1 finds no live hosts.
 
     Raises
     ------
     NmapNotFoundError
-        Propagated immediately if nmap disappears during the sweep.
+        If nmap disappears during either phase.
     """
-    # Collect all usable host addresses as plain strings.
-    # IPv4Network.hosts() excludes the network and broadcast addresses.
-    host_ips: list[str] = [str(ip) for ip in network.hosts()]
-    total = len(host_ips)
+    subnet_str = str(network)
 
-    logger.info(
-        "Starting subnet scan: %s  hosts=%d  threads=%d  profile=%s  timeout=%ds",
-        network, total, max_workers, scan_type, timeout,
+    # ------------------------------------------------------------------ #
+    # Phase 1: Host Discovery                                              #
+    # ------------------------------------------------------------------ #
+    console.print(
+        f"\n  [bold cyan][*][/bold cyan]  "
+        f"Phase 1 — Host Discovery on [bold white]{subnet_str}[/bold white] …"
     )
 
+    live_ips = discover_live_hosts(target=subnet_str, timeout=timeout)
+    live_count = len(live_ips)
+
+    if live_count == 0:
+        console.print(
+            f"  [bold yellow][!][/bold yellow]  "
+            f"No live hosts found in [white]{subnet_str}[/white].  "
+            "Skipping port scan.\n"
+        )
+        return []
+
+    console.print(
+        f"  [bold green][+][/bold green]  "
+        f"Found [bold green]{live_count}[/bold green] active host(s) in "
+        f"[white]{subnet_str}[/white].  "
+        f"Starting Phase 2 — Port Scan "
+        f"([dim]{max_workers} thread(s), profile={scan_type}[/dim]) …\n"
+    )
+
+    logger.info(
+        "Phase 2 start — subnet=%s  live_hosts=%d  threads=%d  "
+        "profile=%s  timeout=%ds",
+        subnet_str, live_count, max_workers, scan_type, timeout,
+    )
+
+    # ------------------------------------------------------------------ #
+    # Phase 2: Targeted Port Scan (only live IPs)                         #
+    # ------------------------------------------------------------------ #
     results: list[ScanResult] = []
 
-    # ThreadPoolExecutor is used as a context manager so all threads are
-    # cleanly joined on exit (normal or exception).
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all hosts at once.  Each Future maps to one IP address.
-        future_to_ip = {
+        # Submit one Future per confirmed-live IP.
+        future_to_ip: dict = {
             executor.submit(_scan_worker, ip, scan_type, timeout): ip
-            for ip in host_ips
+            for ip in live_ips
         }
 
-        # Process results as they complete (not in submission order).
-        # This is more efficient than waiting for all to finish before
-        # processing any.
         completed = 0
         for future in as_completed(future_to_ip):
             ip = future_to_ip[future]
@@ -479,16 +638,12 @@ def _run_subnet_scan(
             try:
                 scan_result = future.result()
             except NmapNotFoundError:
-                # nmap disappeared — cancel remaining futures and abort.
                 logger.error(
-                    "nmap not found during subnet scan — aborting all workers."
+                    "nmap not found during Phase 2 — aborting all workers."
                 )
                 executor.shutdown(wait=False, cancel_futures=True)
                 raise
-
             except Exception as exc:
-                # Any other unexpected exception from the worker: log and
-                # continue so one bad host doesn't kill the whole sweep.
                 logger.warning(
                     "Unexpected error scanning '%s': %s — skipping.", ip, exc
                 )
@@ -497,21 +652,21 @@ def _run_subnet_scan(
             if scan_result is not None:
                 results.append(scan_result)
                 logger.info(
-                    "Host '%s' responded (%d/%d complete).",
-                    ip, completed, total,
+                    "  [%d/%d]  '%s' — port scan complete.",
+                    completed, live_count, ip,
                 )
             else:
                 logger.debug(
-                    "Host '%s' skipped — down or no data (%d/%d).",
-                    ip, completed, total,
+                    "  [%d/%d]  '%s' — skipped (no port data).",
+                    completed, live_count, ip,
                 )
 
-    # Sort by IP address numerically for consistent, predictable output.
+    # Sort results numerically by IP address.
     results.sort(key=lambda r: ipaddress.IPv4Address(r.target))
 
     logger.info(
-        "Subnet scan complete: %s — %d/%d hosts responded.",
-        network, len(results), total,
+        "Subnet scan complete: %s — %d/%d live hosts produced port data.",
+        subnet_str, len(results), live_count,
     )
     return results
 
@@ -522,12 +677,11 @@ def _run_subnet_scan(
 
 def run_scan_from_args(args: argparse.Namespace) -> list[ScanResult]:
     """
-    Parse the validated argparse.Namespace from cli.parse_args() and
-    execute the appropriate scan path.
+    Unpack a validated argparse.Namespace and execute the correct scan path.
 
     Always returns list[ScanResult]:
-      - Single IP / domain → [ScanResult]  (one-element list)
-      - CIDR subnet        → [ScanResult, ...]  (one per responsive host)
+      - Single IP / domain → Phase 1 host check + [ScanResult] if up
+      - CIDR subnet        → Phase 1 ping sweep → Phase 2 port scan
 
     Parameters
     ----------
@@ -538,16 +692,15 @@ def run_scan_from_args(args: argparse.Namespace) -> list[ScanResult]:
     Returns
     -------
     list[ScanResult]
-        May be empty if a subnet scan finds no responsive hosts.
+        Empty if no hosts responded (subnet) or host was down (single).
 
     Raises
     ------
-    AttributeError       — Namespace missing required attributes.
-    NmapNotFoundError    — nmap not on PATH.
-    ScanTimeoutError     — single-host scan exceeded timeout.
-    ScanError            — single-host scan returned non-zero exit code.
+    AttributeError     — Namespace missing required attributes.
+    NmapNotFoundError  — nmap not on PATH.
+    ScanTimeoutError   — single-host port scan exceeded timeout.
+    ScanError          — non-zero nmap exit or subprocess failure.
     """
-    # Validate Namespace shape before touching subprocess.
     required = ("target", "scan_type", "timeout", "threads")
     missing  = [a for a in required if not hasattr(args, a)]
     if missing:
@@ -556,7 +709,6 @@ def run_scan_from_args(args: argparse.Namespace) -> list[ScanResult]:
             "Ensure cli.parse_args() produced this Namespace."
         )
 
-    # Pre-flight nmap check applies to both paths.
     if not is_nmap_available():
         raise NmapNotFoundError(
             "nmap is not installed or not on PATH.\n"
@@ -566,9 +718,33 @@ def run_scan_from_args(args: argparse.Namespace) -> list[ScanResult]:
         )
 
     # ------------------------------------------------------------------ #
-    # Path A: Single IP or domain                                          #
+    # Path A: Single IP or domain — verify host is up, then port-scan     #
     # ------------------------------------------------------------------ #
     if not cli.is_subnet(args.target):
+        # Phase 1 for single hosts: quick liveness check before committing
+        # to a full port scan.  If the host appears down, we warn but still
+        # proceed — ICMP may be blocked even on live hosts.
+        console.print(
+            f"\n  [bold cyan][*][/bold cyan]  "
+            f"Phase 1 — Verifying host [bold white]{args.target}[/bold white] …"
+        )
+        live = discover_live_hosts(target=args.target, timeout=args.timeout)
+        if not live:
+            console.print(
+                f"  [bold yellow][!][/bold yellow]  "
+                f"Host [white]{args.target}[/white] did not respond to ping probes.\n"
+                "  [dim]Proceeding with port scan anyway "
+                "(ICMP may be blocked).[/dim]\n"
+            )
+        else:
+            console.print(
+                f"  [bold green][+][/bold green]  "
+                f"Host [bold green]{args.target}[/bold green] is up.  "
+                "Starting port scan …\n"
+            )
+
+        # Always attempt the port scan for single hosts — ICMP-blocking
+        # firewalls would produce false negatives otherwise.
         result = run_scan(
             target=args.target,
             scan_type=args.scan_type,
@@ -577,10 +753,8 @@ def run_scan_from_args(args: argparse.Namespace) -> list[ScanResult]:
         return [result]
 
     # ------------------------------------------------------------------ #
-    # Path B: CIDR subnet — multi-threaded sweep                          #
+    # Path B: CIDR subnet — two-phase scan                                 #
     # ------------------------------------------------------------------ #
-    # The target was already validated and canonicalised by cli.py, so
-    # strict=False is safe here.
     network = ipaddress.IPv4Network(args.target, strict=False)
 
     return _run_subnet_scan(
@@ -600,10 +774,7 @@ def run_scan_with_metadata(
     scan_type: str = _DEFAULT_SCAN_TYPE,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> dict:
-    """
-    PHASE-2 PLACEHOLDER — Returns structured metadata alongside raw output.
-    Useful for state-comparison / asset-diffing workflows.
-    """
+    """PHASE-2 PLACEHOLDER — metadata dict for state-comparison workflows."""
     result = run_scan(target, scan_type=scan_type, timeout=timeout)
     return {
         "target":     result.target,
@@ -626,10 +797,15 @@ if __name__ == "__main__":
     test_target = _sys.argv[1] if len(_sys.argv) > 1 else "scanme.nmap.org"
 
     print(f"[scanner.py] nmap available : {is_nmap_available()}")
-    print(f"[scanner.py] profiles       : {list(SCAN_PROFILES.keys())}")
     print(f"[scanner.py] target         : {test_target}")
     print(f"[scanner.py] is_subnet      : {cli.is_subnet(test_target)}\n")
 
+    # Quick discovery test
+    print("[scanner.py] Running discover_live_hosts() …")
+    live = discover_live_hosts(test_target, timeout=30)
+    print(f"  Live hosts found: {live}\n")
+
+    # Full pipeline test
     try:
         results = run_scan_from_args(
             argparse.Namespace(
