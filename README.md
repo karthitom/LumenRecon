@@ -89,7 +89,7 @@ nmap --version
 ### 2 — Clone the repository
 
 ```bash
-git clone https://github.com/your-username/lumenrecon.git
+git clone https://github.com/karthitom/lumenrecon.git
 cd lumenrecon
 ```
 
