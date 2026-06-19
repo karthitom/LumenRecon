@@ -1,0 +1,56 @@
+{
+  "target": "scanme.nmap.org",
+  "exported_at": "2026-06-19T16:09:51.632328+00:00Z",
+  "host_count": 1,
+  "hosts": [
+    {
+      "host": "45.33.32.156",
+      "hostname": "scanme.nmap.org",
+      "state": "up",
+      "ports": [
+        {
+          "port": 22,
+          "protocol": "tcp",
+          "state": "open",
+          "service": "ssh",
+          "version": ""
+        },
+        {
+          "port": 25,
+          "protocol": "tcp",
+          "state": "filtered",
+          "service": "smtp",
+          "version": ""
+        },
+        {
+          "port": 80,
+          "protocol": "tcp",
+          "state": "open",
+          "service": "http",
+          "version": ""
+        },
+        {
+          "port": 135,
+          "protocol": "tcp",
+          "state": "filtered",
+          "service": "msrpc",
+          "version": ""
+        },
+        {
+          "port": 139,
+          "protocol": "tcp",
+          "state": "filtered",
+          "service": "netbios-ssn",
+          "version": ""
+        },
+        {
+          "port": 445,
+          "protocol": "tcp",
+          "state": "filtered",
+          "service": "microsoft-ds",
+          "version": ""
+        }
+      ]
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 """
-main.py — Orchestrator & Entry Point
-======================================
+main.py — Orchestrator & Entry Point  [LumenRecon v2.0]
+=========================================================
 Single entry point for LumenRecon — The Network Illuminator.
 Ties every module together in order:
 
@@ -12,8 +12,10 @@ Flow
     2.  Parse & validate arguments with cli.parse_args().
     3.  Print banner + scan summary header.
     4.  Run nmap via scanner.run_scan_from_args() behind a Rich spinner.
-    5.  Parse raw stdout with parser.parse_nmap_output().
-    6.  Render results table via reporter.render_table().
+        Returns list[ScanResult] for both single and subnet targets.
+    5.  Parse each ScanResult.stdout with parser.parse_nmap_output().
+    6.  Render results via reporter.render_table() (single host) or
+        reporter.render_multi() (subnet).
     7.  Optionally export to file via reporter.export_report().
 """
 
@@ -150,9 +152,11 @@ def print_help() -> None:
     args_table.add_row(
         "-t  /  --target",
         "[bold green]YES[/bold green]",
-        "The IP address or domain name you want to scan.\n"
-        "[dim]Must be a valid IPv4 or a real domain name.[/dim]",
-        "-t 192.168.1.1\n-t example.com",
+        "The IP, CIDR subnet, or domain to scan.\n"
+        "[dim]IPv4  : 192.168.1.1\n"
+        "CIDR  : 192.168.1.0/24  (prefix /16–/32)\n"
+        "Domain: example.com[/dim]",
+        "-t 192.168.1.1\n-t 10.0.0.0/24\n-t example.com",
     )
     args_table.add_row(
         "-s  /  --scan-type",
@@ -170,10 +174,17 @@ def print_help() -> None:
         "-o json\n-o csv",
     )
     args_table.add_row(
+        "-T  /  --threads",
+        "[dim]no (default: 10)[/dim]",
+        "Parallel worker threads for subnet scans.\n"
+        "[dim]Range: 1–50.  Ignored for single IP / domain.[/dim]",
+        "-T 10\n-T 25",
+    )
+    args_table.add_row(
         "--timeout",
         "[dim]no (default: 300s)[/dim]",
-        "How many seconds to wait before giving up.\n"
-        "[dim]Raise this for slow networks or a full scan.[/dim]",
+        "Per-host timeout in seconds.\n"
+        "[dim]Raise this for slow networks or full scans.[/dim]",
         "--timeout 60\n--timeout 600",
     )
     args_table.add_row(
@@ -204,16 +215,20 @@ def print_help() -> None:
         "Quick scan of top 100 ports.\nResults shown in terminal only.",
     )
     ex_table.add_row(
+        "python main.py -t 192.168.1.0/24 -T 20",
+        "Subnet sweep — 20 parallel threads.\nSkips down/filtered hosts automatically.",
+    )
+    ex_table.add_row(
         "python main.py -t example.com -s service",
         "Service & version detection on a domain.\nShows software names and versions.",
     )
     ex_table.add_row(
-        "python main.py -t 10.0.0.5 -s full -o json",
-        "Full scan of all 65535 ports.\nSaves results to reports/ as JSON.",
+        "python main.py -t 10.0.0.0/24 -s fast -o json -T 30",
+        "Fast subnet sweep — 30 threads.\nSaves all results to reports/ as JSON.",
     )
     ex_table.add_row(
-        "python main.py -t 10.0.0.5 -o csv --timeout 600",
-        "Quick scan with CSV export.\nExtra-long timeout for slow networks.",
+        "python main.py -t 10.0.0.5 -s full -o csv --timeout 600",
+        "Full scan of all 65535 ports.\nCSV export, extended timeout.",
     )
 
     console.print(ex_table)
@@ -250,18 +265,30 @@ def print_help() -> None:
 # ---------------------------------------------------------------------------
 
 def _print_scan_summary(args) -> None:
-    """Render a compact pre-scan summary panel."""
+    """Render a compact pre-scan summary panel, including thread count."""
+    is_subnet = cli.is_subnet(args.target)
     output_label = (
         f"[bold white]{args.output.upper()}[/bold white] → [cyan]reports/[/cyan]"
         if args.output
         else "[dim]terminal only[/dim]"
     )
+    threads_label = (
+        f"[bold white]{args.threads}[/bold white]"
+        if is_subnet
+        else "[dim]N/A — single host[/dim]"
+    )
+    mode_label = (
+        "[bold yellow]SUBNET[/bold yellow]" if is_subnet
+        else "[bold white]SINGLE HOST[/bold white]"
+    )
 
     summary = (
         f"  [dim]Target    :[/dim]   [bold cyan]{args.target}[/bold cyan]\n"
+        f"  [dim]Mode      :[/dim]   {mode_label}\n"
         f"  [dim]Scan Type :[/dim]   [bold white]{args.scan_type}[/bold white]\n"
+        f"  [dim]Threads   :[/dim]   {threads_label}\n"
         f"  [dim]Output    :[/dim]   {output_label}\n"
-        f"  [dim]Timeout   :[/dim]   [bold white]{args.timeout}s[/bold white]"
+        f"  [dim]Timeout   :[/dim]   [bold white]{args.timeout}s[/bold white] per host"
     )
 
     console.print(
@@ -292,11 +319,10 @@ def main() -> None:
     """
     # ------------------------------------------------------------------ #
     # 0. Intercept -h / --help BEFORE argparse runs                       #
-    #    We want our Rich help menu, not argparse's plain-text default.   #
     # ------------------------------------------------------------------ #
     if len(sys.argv) == 1 or any(a in sys.argv[1:] for a in ("-h", "--help")):
         print_banner()
-        print_help()                     # calls sys.exit(0) internally
+        print_help()   # calls sys.exit(0) internally
 
     # ------------------------------------------------------------------ #
     # 1. Print banner                                                      #
@@ -305,73 +331,98 @@ def main() -> None:
 
     # ------------------------------------------------------------------ #
     # 2. Parse & validate CLI arguments                                    #
-    #    Any invalid input causes argparse to print an error and exit(2). #
     # ------------------------------------------------------------------ #
     args = cli.parse_args()
 
+    # Determine mode once — used in several places below.
+    is_subnet_scan = cli.is_subnet(args.target)
+
     # ------------------------------------------------------------------ #
-    # 3. Show scan configuration summary                                  #
+    # 3. Scan configuration summary                                        #
     # ------------------------------------------------------------------ #
     _print_scan_summary(args)
 
     # ------------------------------------------------------------------ #
-    # 4. Execute Nmap scan behind a Rich loading spinner                  #
+    # 4. Execute scan(s) behind a Rich spinner                             #
+    # run_scan_from_args() always returns list[ScanResult].               #
     # ------------------------------------------------------------------ #
-    scan_result: scanner.ScanResult | None = None
+    scan_results: list[scanner.ScanResult] = []
 
-    with console.status(
-        f"[bold bright_cyan][ LUMENRECON ] [white]{args.target}[/white]  "
+    spinner_label = (
+        f"[bold bright_cyan][ LUMENRECON ]  "
+        f"[white]{args.target}[/white]  "
+        f"[dim]mode=[/dim][white]{'subnet' if is_subnet_scan else 'single'}[/white]  "
         f"[dim]profile=[/dim][white]{args.scan_type}[/white]  "
-        f"[dim]timeout=[/dim][white]{args.timeout}s[/white] …[/bold bright_cyan]",
-        spinner="dots",
-        spinner_style="bold cyan",
-    ):
+        f"[dim]threads=[/dim][white]{args.threads if is_subnet_scan else 1}[/white]"
+        f"  …[/bold bright_cyan]"
+    )
+
+    with console.status(spinner_label, spinner="dots", spinner_style="bold cyan"):
         try:
-            scan_result = scanner.run_scan_from_args(args)
+            scan_results = scanner.run_scan_from_args(args)
 
         except scanner.NmapNotFoundError as exc:
             console.print(
-                f"\n  [bold red]✖  nmap not found[/bold red]\n"
-                f"  [dim]{exc}[/dim]\n"
+                f"\n  [bold red]✖  nmap not found[/bold red]\n  [dim]{exc}[/dim]\n"
             )
             sys.exit(1)
 
         except scanner.ScanTimeoutError as exc:
             console.print(
-                f"\n  [bold yellow]⏱  Scan timed out[/bold yellow]\n"
-                f"  [dim]{exc}[/dim]\n"
+                f"\n  [bold yellow]⏱  Scan timed out[/bold yellow]\n  [dim]{exc}[/dim]\n"
             )
             sys.exit(1)
 
         except scanner.ScanError as exc:
             console.print(
-                f"\n  [bold red]✖  Scan failed[/bold red]\n"
-                f"  [dim]{exc}[/dim]\n"
+                f"\n  [bold red]✖  Scan failed[/bold red]\n  [dim]{exc}[/dim]\n"
             )
             sys.exit(1)
 
-    # Spinner exited — confirm completion with timestamp.
-    console.print(
-        f"  [bold bright_green]✔  Scan complete[/bold bright_green]"
-        f"  [dim]({scan_result.iso_timestamp})[/dim]\n"
-    )
+    # Show completion — use the last result's timestamp for single scans.
+    if scan_results:
+        ts_label = scan_results[-1].iso_timestamp
+        host_label = (
+            f"{len(scan_results)} host(s) responded"
+            if is_subnet_scan
+            else scan_results[0].target
+        )
+        console.print(
+            f"  [bold bright_green]✔  Scan complete[/bold bright_green]"
+            f"  [dim]{host_label}  ({ts_label})[/dim]\n"
+        )
+    else:
+        console.print(
+            "  [bold yellow]⚠  Scan returned no results — "
+            "all hosts may be down or filtered.[/bold yellow]\n"
+        )
+        sys.exit(0)
 
     # ------------------------------------------------------------------ #
-    # 5. Parse raw nmap stdout into structured data                       #
+    # 5. Parse each ScanResult.stdout → structured dicts                  #
     # ------------------------------------------------------------------ #
-    scan_data = parser.parse_nmap_output(scan_result.stdout)
+    parsed_results: list[dict] = [
+        parser.parse_nmap_output(r.stdout) for r in scan_results
+    ]
 
     # ------------------------------------------------------------------ #
-    # 6. Render results to the terminal                                   #
+    # 6. Render results                                                    #
     # ------------------------------------------------------------------ #
-    reporter.render_table(scan_data)
+    if is_subnet_scan:
+        # Multi-host grouped display
+        reporter.render_multi(parsed_results)
+    else:
+        # Single-host display — unchanged from v1
+        reporter.render_table(parsed_results[0])
 
     # ------------------------------------------------------------------ #
-    # 7. Export to file if --output was requested                         #
+    # 7. Export to file if --output was requested                          #
     # ------------------------------------------------------------------ #
     if args.output:
+        # Pass list for subnet, dict for single — reporter handles both.
+        export_data = parsed_results if is_subnet_scan else parsed_results[0]
         reporter.export_report(
-            scan_data=scan_data,
+            scan_data=export_data,
             fmt=args.output,
             target=args.target,
         )
@@ -379,14 +430,12 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # Phase-2 placeholder: state comparison / asset diffing               #
     # ------------------------------------------------------------------ #
-    # Uncomment when Phase 2 (persistent state) is implemented:
-    #
     # from pathlib import Path
     # import json
     # latest = Path("reports") / "latest.json"
     # if latest.exists():
     #     previous = json.loads(latest.read_text())
-    #     diff = parser.diff_scans(previous, scan_data)
+    #     diff = parser.diff_scans(previous, parsed_results[0])
     #     reporter.render_diff(diff)
 
 

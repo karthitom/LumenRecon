@@ -1,25 +1,36 @@
 """
-cli.py — Command-Line Interface Module
-========================================
+cli.py — Command-Line Interface Module  [LumenRecon v2.0]
+==========================================================
 Provides a robust, validated argument parser for LumenRecon.
 
-Usage examples:
-    python main.py -t 192.168.1.1
-    python main.py -t example.com -o json --scan-type service --timeout 120
+V2.0 additions
+--------------
+  - -t / --target now accepts CIDR subnet notation (e.g. 192.168.1.0/24)
+    in addition to single IPv4 addresses and domain names.
+  - -T / --threads sets the worker-thread count for subnet scans (1–50).
 
-Security notes:
-    - Target input is validated against a strict allowlist regex and the
-      standard-library `ipaddress` module before it ever reaches the scanner.
-    - No shell interpolation of user-supplied values occurs here; the raw
-      validated string is passed as a list element to subprocess in scanner.py.
-    - Output format is constrained to an explicit choices list — no free-form
-      strings can reach the file-writing layer.
+Usage examples
+--------------
+    python main.py -t 192.168.1.1
+    python main.py -t 192.168.1.0/24 -T 20 -s fast
+    python main.py -t example.com -o json -s service --timeout 120
+
+Security notes
+--------------
+  - Target input is validated through a strict three-branch pipeline:
+      1. IPv4 single address   (ipaddress.IPv4Address)
+      2. CIDR subnet notation  (ipaddress.IPv4Network)
+      3. Domain / hostname     (RFC-1123 compiled regex)
+    Only strings that survive one of these branches ever reach the scanner.
+  - Reserved/special address ranges are blocked on both single IPs and the
+    network address of a submitted subnet.
+  - Thread count is hard-capped at 50 to prevent resource exhaustion.
+  - No shell interpolation occurs anywhere in this module.
 """
 
 import argparse
 import ipaddress
 import re
-import sys
 from typing import Optional
 
 
@@ -27,23 +38,17 @@ from typing import Optional
 # Validation constants
 # ---------------------------------------------------------------------------
 
-# RFC-1123 hostname label: 1-63 chars, alphanumeric or hyphens, no leading/
-# trailing hyphen.  A full domain is one or more such labels separated by dots,
-# with an optional trailing dot (FQDN).  TLD must be at least 2 characters.
-#
-# This intentionally does NOT accept:
-#   - Labels longer than 63 characters
-#   - Labels starting or ending with a hyphen
-#   - Pure numeric labels that would look like IPv4 octets (those are handled
-#     separately by the ipaddress module)
-#   - Wildcards, shell metacharacters, or path separators
+# RFC-1123 hostname label allowlist regex.
+# Intentionally rejects: labels > 63 chars, leading/trailing hyphens,
+# pure-numeric labels (handled by ipaddress), shell metacharacters,
+# path separators, and the '/' character (which would look like CIDR).
 _DOMAIN_RE = re.compile(
     r"""
     ^                           # start of string
     (?!-)                       # label must not start with a hyphen
     (?:                         # one or more dot-separated labels
         [A-Za-z0-9]             # label starts with alphanumeric
-        (?:[A-Za-z0-9\-]{0,61}  # up to 61 more alphanum/hyphen chars
+        (?:[A-Za-z0-9\-]{0,61}  # up to 61 more alphanumeric / hyphen chars
         [A-Za-z0-9])?           # label ends with alphanumeric (if > 1 char)
         \.                      # dot separator
     )*
@@ -56,27 +61,40 @@ _DOMAIN_RE = re.compile(
     re.VERBOSE,
 )
 
-# Maximum total length of a domain name per RFC 1035 § 3.1.
+# Per RFC 1035 § 3.1 — maximum total length of a domain name.
 _DOMAIN_MAX_LEN: int = 253
 
-# Valid scan profiles (must stay in sync with scanner.SCAN_PROFILES).
+# Subnet size guard: refuse subnets larger than /16 (65534 usable hosts).
+# This prevents accidental wide-area scanning on a mistyped prefix length.
+# Adjust in authorised lab environments only.
+_MAX_PREFIX_LEN_ALLOWED: int = 16   # /16 = up to 65534 hosts (absolute max)
+_MIN_PREFIX_LEN_SAFE:    int = 16   # enforce same value as a hard floor
+
+# Valid scan profiles — must stay in sync with scanner.SCAN_PROFILES.
 _SCAN_TYPES: tuple[str, ...] = ("fast", "service", "full")
 
 # Valid output formats.
 _OUTPUT_FORMATS: tuple[str, ...] = ("json", "csv")
 
-# Default scan timeout in seconds (mirrors scanner.DEFAULT_TIMEOUT).
-_DEFAULT_TIMEOUT: int = 300
+# Default values.
+_DEFAULT_TIMEOUT: int = 300   # seconds
+_DEFAULT_THREADS: int = 10    # worker threads for subnet scans
+_MAX_THREADS:     int = 50    # hard ceiling to prevent resource exhaustion
 
 
 # ---------------------------------------------------------------------------
-# Input validators — used as argparse `type` callables
+# Input validators — used as argparse `type=` callables
 # ---------------------------------------------------------------------------
 
 def _validate_target(value: str) -> str:
     """
-    Validate that *value* is either a well-formed IPv4 address or a legal
-    domain / hostname.
+    Validate that *value* is one of:
+      (a) A single well-formed, routable IPv4 address, or
+      (b) A valid CIDR subnet (e.g. 192.168.1.0/24, prefix /16 to /32), or
+      (c) A legal RFC-1123 domain / hostname.
+
+    The validation pipeline is ordered from most-specific to least:
+      IPv4Address  →  IPv4Network  →  domain regex
 
     Parameters
     ----------
@@ -86,51 +104,68 @@ def _validate_target(value: str) -> str:
     Returns
     -------
     str
-        The stripped, lower-cased target string if valid.
+        The stripped, normalised target string.  For CIDR notation the
+        network address is normalised (e.g. '192.168.1.5/24' becomes
+        '192.168.1.0/24') so the scanner always receives a canonical form.
 
     Raises
     ------
     argparse.ArgumentTypeError
-        If the value fails both IPv4 and domain validation, so argparse can
-        emit a clean error and exit without a traceback.
+        On any validation failure, with a human-readable explanation.
     """
-    # Strip surrounding whitespace; lower-case for normalisation.
     cleaned = value.strip().lower()
 
     if not cleaned:
         raise argparse.ArgumentTypeError("Target must not be empty.")
 
-    # --- 1. Try IPv4 first (ipaddress handles all edge cases) -------------
-    try:
-        addr = ipaddress.IPv4Address(cleaned)
+    # ------------------------------------------------------------------ #
+    # Branch 1: Single IPv4 address                                        #
+    # ------------------------------------------------------------------ #
+    # Only attempt this branch if the string contains no '/' character,
+    # because '192.168.1.0/24' would parse as IPv4Address('192.168.1.0')
+    # and silently discard the prefix length.
+    if "/" not in cleaned:
+        try:
+            addr = ipaddress.IPv4Address(cleaned)
+            _check_address_flags(addr, cleaned)   # raises on reserved ranges
+            return cleaned
+        except ValueError:
+            pass   # Not a bare IPv4 address — try CIDR next.
 
-        # Reject reserved/special ranges that should never be scan targets
-        # in a legitimate recon workflow (loopback, link-local, multicast,
-        # unspecified).  You may relax these guards in a lab environment.
-        if addr.is_loopback:
+    # ------------------------------------------------------------------ #
+    # Branch 2: CIDR subnet notation                                       #
+    # ------------------------------------------------------------------ #
+    if "/" in cleaned:
+        try:
+            # strict=False: host bits set are silently zeroed so the user
+            # can write 192.168.1.5/24 and get 192.168.1.0/24 back.
+            network = ipaddress.IPv4Network(cleaned, strict=False)
+        except ValueError:
             raise argparse.ArgumentTypeError(
-                f"Loopback address '{cleaned}' is not a valid scan target."
-            )
-        if addr.is_unspecified:
-            raise argparse.ArgumentTypeError(
-                f"Unspecified address '{cleaned}' (0.0.0.0) is not a valid scan target."
-            )
-        if addr.is_multicast:
-            raise argparse.ArgumentTypeError(
-                f"Multicast address '{cleaned}' is not a valid scan target."
-            )
-        if addr.is_link_local:
-            raise argparse.ArgumentTypeError(
-                f"Link-local address '{cleaned}' is not a valid scan target."
+                f"'{value}' is not a valid IPv4 CIDR subnet.\n"
+                "  Expected format: 192.168.1.0/24  (prefix length /8 – /32)"
             )
 
-        # Valid, routable (or private) IPv4 — accept it.
-        return cleaned
+        # Validate the network address itself (not every host — the network
+        # address represents the intent of the whole range).
+        _check_address_flags(network.network_address, str(network.network_address))
 
-    except ValueError:
-        pass  # Not an IPv4 — fall through to domain check.
+        # Enforce a minimum prefix length to prevent scanning /8 or wider.
+        if network.prefixlen < _MIN_PREFIX_LEN_SAFE:
+            raise argparse.ArgumentTypeError(
+                f"Subnet '{value}' has a /{network.prefixlen} prefix — "
+                f"that covers {network.num_addresses:,} addresses.\n"
+                f"  The minimum allowed prefix is /{_MIN_PREFIX_LEN_SAFE} "
+                f"({2 ** (32 - _MIN_PREFIX_LEN_SAFE):,} addresses).\n"
+                "  Use a more specific subnet or scan individual hosts."
+            )
 
-    # --- 2. Try domain / hostname -----------------------------------------
+        # Return the canonical (host-bits-zeroed) CIDR string.
+        return str(network)
+
+    # ------------------------------------------------------------------ #
+    # Branch 3: Domain / hostname                                          #
+    # ------------------------------------------------------------------ #
     if len(cleaned) > _DOMAIN_MAX_LEN:
         raise argparse.ArgumentTypeError(
             f"Domain name too long ({len(cleaned)} chars; max {_DOMAIN_MAX_LEN})."
@@ -138,27 +173,62 @@ def _validate_target(value: str) -> str:
 
     if not _DOMAIN_RE.match(cleaned):
         raise argparse.ArgumentTypeError(
-            f"'{value}' is not a valid IPv4 address or domain name.\n"
-            "  Expected examples: 192.168.1.1  |  example.com  |  sub.domain.org"
+            f"'{value}' is not a valid IPv4 address, CIDR subnet, or domain name.\n"
+            "  Single IP  : 192.168.1.1\n"
+            "  CIDR subnet: 192.168.1.0/24\n"
+            "  Domain     : example.com"
         )
 
-    # Reject purely numeric labels (e.g. "192.168.1.999") that look like a
-    # malformed IPv4 but aren't a valid hostname either.
+    # Reject purely numeric labels that look like malformed IPv4.
     labels = cleaned.rstrip(".").split(".")
     if all(label.isdigit() for label in labels):
         raise argparse.ArgumentTypeError(
             f"'{value}' looks like an IPv4 address but is not valid.\n"
-            "  Each octet must be 0–255. Expected example: 192.168.1.1"
+            "  Each octet must be 0–255.  Example: 192.168.1.1"
         )
 
     return cleaned
 
 
+def _check_address_flags(addr: ipaddress.IPv4Address, label: str) -> None:
+    """
+    Raise ArgumentTypeError if *addr* is a reserved range that should never
+    be a scan target in a legitimate recon workflow.
+
+    Parameters
+    ----------
+    addr : ipaddress.IPv4Address
+        The address to check.
+    label : str
+        Human-readable label to include in the error message (the original
+        user-supplied string or the network address string).
+
+    Raises
+    ------
+    argparse.ArgumentTypeError
+        If the address is loopback, unspecified, multicast, or link-local.
+    """
+    if addr.is_loopback:
+        raise argparse.ArgumentTypeError(
+            f"Loopback address '{label}' is not a valid scan target."
+        )
+    if addr.is_unspecified:
+        raise argparse.ArgumentTypeError(
+            f"Unspecified address '{label}' (0.0.0.0) is not a valid scan target."
+        )
+    if addr.is_multicast:
+        raise argparse.ArgumentTypeError(
+            f"Multicast address '{label}' is not a valid scan target."
+        )
+    if addr.is_link_local:
+        raise argparse.ArgumentTypeError(
+            f"Link-local address '{label}' is not a valid scan target."
+        )
+
+
 def _validate_output(value: str) -> str:
     """
-    Constrain the -o / --output argument to the exact strings 'json' or
-    'csv'.  Argparse's built-in `choices=` would also work, but using a
-    custom validator gives a friendlier, lower-case normalised error.
+    Constrain --output to the exact strings 'json' or 'csv'.
 
     Parameters
     ----------
@@ -168,7 +238,7 @@ def _validate_output(value: str) -> str:
     Returns
     -------
     str
-        Lower-cased format string if valid.
+        Lower-cased, validated format string.
 
     Raises
     ------
@@ -186,7 +256,7 @@ def _validate_output(value: str) -> str:
 
 def _validate_timeout(value: str) -> int:
     """
-    Validate that the timeout is a positive integer within a sensible range.
+    Validate that --timeout is a positive integer ≤ 86400 (24 h).
 
     Parameters
     ----------
@@ -212,16 +282,56 @@ def _validate_timeout(value: str) -> int:
 
     if seconds <= 0:
         raise argparse.ArgumentTypeError(
-            "Timeout must be a positive integer (e.g., 60, 300)."
+            "Timeout must be a positive integer (e.g. 60, 300)."
         )
-
-    # Soft upper cap: 24 hours.  Adjust if you genuinely need longer scans.
     if seconds > 86_400:
         raise argparse.ArgumentTypeError(
             f"Timeout {seconds}s exceeds the maximum allowed value of 86400s (24 h)."
         )
-
     return seconds
+
+
+def _validate_threads(value: str) -> int:
+    """
+    Validate that -T / --threads is a positive integer between 1 and
+    _MAX_THREADS (inclusive).
+
+    Keeping the ceiling at 50 threads prevents runaway resource consumption
+    when scanning large subnets on resource-constrained machines.
+
+    Parameters
+    ----------
+    value : str
+        Raw user-supplied string.
+
+    Returns
+    -------
+    int
+        Validated thread count.
+
+    Raises
+    ------
+    argparse.ArgumentTypeError
+        If the value is outside the permitted range.
+    """
+    try:
+        count = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Thread count '{value}' must be an integer."
+        )
+
+    if count < 1:
+        raise argparse.ArgumentTypeError(
+            "Thread count must be at least 1."
+        )
+    if count > _MAX_THREADS:
+        raise argparse.ArgumentTypeError(
+            f"Thread count {count} exceeds the maximum of {_MAX_THREADS}.\n"
+            "  High thread counts can overwhelm network equipment and your machine.\n"
+            f"  Use -T {_MAX_THREADS} or lower."
+        )
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -230,22 +340,23 @@ def _validate_timeout(value: str) -> int:
 
 def _build_parser() -> argparse.ArgumentParser:
     """
-    Construct and return the ArgumentParser for the Recon Tool CLI.
+    Construct and return the fully configured ArgumentParser for LumenRecon.
 
-    Keeping parser construction in its own function makes it trivial to unit-
-    test argument definitions without side-effects.
+    Separating construction from parsing makes this trivial to unit-test
+    without touching sys.argv or triggering side-effects.
 
     Returns
     -------
     argparse.ArgumentParser
-        Fully configured parser ready for `.parse_args()`.
+        Ready for .parse_args().
     """
-    parser = argparse.ArgumentParser(
+    p = argparse.ArgumentParser(
         prog="lumenrecon",
         description=(
-            "LumenRecon — Advanced Network Asset Monitor\n"
-            "The Network Illuminator: safely illuminating hidden services and open\n"
-            "ports within authorised networks for defensive posture assessment.\n"
+            "LumenRecon v2.0 — Advanced Network Asset Monitor\n"
+            "The Network Illuminator: safely illuminating hidden services and\n"
+            "open ports within authorised networks for defensive posture assessment.\n"
+            "Supports single IPs, domain names, and CIDR subnet scanning.\n"
             "For authorised use on permitted targets only."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -253,42 +364,44 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # ------------------------------------------------------------------ #
-    # Required argument                                                    #
+    # Required                                                             #
     # ------------------------------------------------------------------ #
-    parser.add_argument(
+    p.add_argument(
         "-t", "--target",
         required=True,
-        metavar="<IP|DOMAIN>",
-        type=_validate_target,           # custom validator runs inline
+        metavar="<IP|CIDR|DOMAIN>",
+        type=_validate_target,
         help=(
-            "Target IPv4 address (e.g. 192.168.1.1) or domain name "
-            "(e.g. example.com) to scan. "
-            "Must be a host you are authorised to test."
+            "Target to scan. Accepted formats:\n"
+            "  Single IPv4 : 192.168.1.1\n"
+            "  CIDR subnet : 192.168.1.0/24  (prefix /16 to /32)\n"
+            "  Domain name : example.com\n"
+            "Must be a host or network you are authorised to test."
         ),
     )
 
     # ------------------------------------------------------------------ #
-    # Optional: output format                                              #
+    # Optional — output format                                             #
     # ------------------------------------------------------------------ #
-    parser.add_argument(
+    p.add_argument(
         "-o", "--output",
         required=False,
         default=None,
         metavar="<json|csv>",
-        type=_validate_output,           # constrained to 'json' or 'csv'
+        type=_validate_output,
         help=(
-            "Save the scan report to a file. "
+            "Save the scan report to a file in reports/. "
             "Accepted values: json, csv. "
-            "If omitted, results are printed to the terminal only."
+            "Omit to display results in the terminal only."
         ),
     )
 
     # ------------------------------------------------------------------ #
-    # Optional: scan type                                                  #
+    # Optional — scan profile                                              #
     # ------------------------------------------------------------------ #
-    parser.add_argument(
+    p.add_argument(
         "-s", "--scan-type",
-        dest="scan_type",                # maps to args.scan_type
+        dest="scan_type",
         required=False,
         default="fast",
         choices=_SCAN_TYPES,
@@ -302,22 +415,39 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # ------------------------------------------------------------------ #
-    # Optional: timeout                                                    #
+    # Optional — per-host timeout                                          #
     # ------------------------------------------------------------------ #
-    parser.add_argument(
+    p.add_argument(
         "--timeout",
         required=False,
         default=_DEFAULT_TIMEOUT,
         metavar="<seconds>",
         type=_validate_timeout,
         help=(
-            f"Maximum seconds to wait for the scan to complete. "
+            f"Per-host scan timeout in seconds. "
             f"Default: {_DEFAULT_TIMEOUT}s. "
-            "Increase for large subnets or slow networks."
+            "Increase for slow networks or full-port scans."
         ),
     )
 
-    return parser
+    # ------------------------------------------------------------------ #
+    # Optional — thread count (v2.0, subnet scans only)                   #
+    # ------------------------------------------------------------------ #
+    p.add_argument(
+        "-T", "--threads",
+        required=False,
+        default=_DEFAULT_THREADS,
+        metavar=f"<1–{_MAX_THREADS}>",
+        type=_validate_threads,
+        help=(
+            f"Number of parallel worker threads for subnet scanning. "
+            f"Default: {_DEFAULT_THREADS}. "
+            f"Maximum: {_MAX_THREADS}. "
+            "Has no effect when scanning a single IP or domain."
+        ),
+    )
+
+    return p
 
 
 # ---------------------------------------------------------------------------
@@ -328,39 +458,57 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     """
     Parse, validate, and return the command-line arguments.
 
-    This is the single entry-point consumed by ``main.py``.  Validation is
-    performed by the `type=` callables registered on each argument — any
-    failure causes argparse to print a clean error and call ``sys.exit(2)``
-    automatically, so callers do not need to wrap this in a try/except.
+    The single entry-point consumed by ``main.py``.  All validation is
+    performed by the ``type=`` callables registered above — any failure
+    causes argparse to print a clean error message and call sys.exit(2).
 
     Parameters
     ----------
     argv : list[str] | None
-        Argument list to parse.  Defaults to ``sys.argv[1:]`` when ``None``.
-        Pass an explicit list in tests to avoid touching the real argv.
+        Argument list to parse.  Defaults to sys.argv[1:] when None.
+        Pass an explicit list in unit tests to avoid touching sys.argv.
 
     Returns
     -------
     argparse.Namespace
-        Namespace with the following attributes:
-            - target    (str)            validated IPv4 or domain
-            - output    (str | None)     'json', 'csv', or None
-            - scan_type (str)            'fast', 'service', or 'full'
-            - timeout   (int)            positive integer, seconds
+        Attributes:
+            target    (str)          validated IPv4, CIDR, or domain
+            output    (str | None)   'json', 'csv', or None
+            scan_type (str)          'fast', 'service', or 'full'
+            timeout   (int)          positive integer, seconds
+            threads   (int)          1–50, worker thread count
     """
-    parser = _build_parser()
-    args = parser.parse_args(argv)
-    return args
+    return _build_parser().parse_args(argv)
 
 
 # ---------------------------------------------------------------------------
-# Stand-alone smoke-test (python cli.py -t 192.168.1.1 -o json)
+# Helpers for callers to inspect the parsed target type
+# ---------------------------------------------------------------------------
+
+def is_subnet(target: str) -> bool:
+    """
+    Return True if *target* is a CIDR subnet string (contains '/').
+
+    This is the canonical way for scanner.py and main.py to branch
+    between single-host and multi-host scan paths without re-parsing.
+
+    Parameters
+    ----------
+    target : str
+        A string that was previously returned by _validate_target().
+    """
+    return "/" in target
+
+
+# ---------------------------------------------------------------------------
+# Stand-alone smoke-test
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parsed = parse_args()
-    print(f"[cli.py] Parsed arguments:")
-    print(f"  target    = {parsed.target!r}")
-    print(f"  output    = {parsed.output!r}")
-    print(f"  scan_type = {parsed.scan_type!r}")
-    print(f"  timeout   = {parsed.timeout!r}")
+    args = parse_args()
+    print("[cli.py] Parsed arguments:")
+    print(f"  target    = {args.target!r}  (subnet={is_subnet(args.target)})")
+    print(f"  output    = {args.output!r}")
+    print(f"  scan_type = {args.scan_type!r}")
+    print(f"  timeout   = {args.timeout!r}")
+    print(f"  threads   = {args.threads!r}")
