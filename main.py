@@ -95,18 +95,15 @@ def main() -> None:
         spinner_style="bold green",
     ):
         try:
-            raw_output = scanner.run_scan(
-                target=args.target,
-                scan_type=args.scan_type,
-                timeout=args.timeout,
-            )
-        except EnvironmentError as exc:
+            scan_result = scanner.run_scan_from_args(args)
+            raw_output = scan_result.stdout
+        except scanner.NmapNotFoundError as exc:
             console.print(f"\n  [bold red]✖  {exc}[/bold red]\n")
             sys.exit(1)
-        except TimeoutError as exc:
+        except scanner.ScanTimeoutError as exc:
             console.print(f"\n  [bold yellow]⏱  {exc}[/bold yellow]\n")
             sys.exit(1)
-        except RuntimeError as exc:
+        except scanner.ScanError as exc:
             console.print(f"\n  [bold red]✖  {exc}[/bold red]\n")
             sys.exit(1)
 
